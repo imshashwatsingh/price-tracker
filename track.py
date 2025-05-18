@@ -24,22 +24,33 @@ USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.101 Safari/537.36'
 ]
 
-# Database setup
+# Database setup with migration
 def init_db():
     conn = sqlite3.connect('price_tracker.db')
     c = conn.cursor()
+    
+    # Create products table if it doesn't exist
     c.execute('''CREATE TABLE IF NOT EXISTS products
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   url TEXT UNIQUE,
                   name TEXT,
-                  target_price REAL,
-                  last_notified_price REAL)''')
+                  target_price REAL)''')
+    
+    # Check if last_notified_price column exists
+    c.execute("PRAGMA table_info(products)")
+    columns = [col[1] for col in c.fetchall()]
+    if 'last_notified_price' not in columns:
+        logging.info("Adding last_notified_price column to products table")
+        c.execute("ALTER TABLE products ADD COLUMN last_notified_price REAL")
+    
+    # Create price_history table
     c.execute('''CREATE TABLE IF NOT EXISTS price_history
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   product_id INTEGER,
                   price REAL,
                   timestamp TEXT,
                   FOREIGN KEY (product_id) REFERENCES products(id))''')
+    
     conn.commit()
     conn.close()
 
@@ -221,11 +232,13 @@ class PriceTrackerApp:
         ttk.Button(button_frame, text="Clear All", command=self.clear_all).pack(side=tk.RIGHT, padx=10)
 
         # Product List
-        self.tree = ttk.Treeview(root, columns=("Name", "URL", "Target Price", "Latest Price"), show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(root, columns=("ID", "Name", "URL", "Target Price", "Latest Price"), show="headings", selectmode="browse")
+        self.tree.heading("ID", text="ID", command=lambda: self.sort_column("ID", False))
         self.tree.heading("Name", text="Product Name", command=lambda: self.sort_column("Name", False))
         self.tree.heading("URL", text="URL", command=lambda: self.sort_column("URL", False))
         self.tree.heading("Target Price", text="Target Price ($)", command=lambda: self.sort_column("Target Price", False))
         self.tree.heading("Latest Price", text="Latest Price ($)", command=lambda: self.sort_column("Latest Price", False))
+        self.tree.column("ID", width=0, stretch=False)  # Hidden ID column
         self.tree.column("Name", width=250, anchor="w")
         self.tree.column("URL", width=300, anchor="w")
         self.tree.column("Target Price", width=120, anchor="center")
@@ -270,7 +283,7 @@ class PriceTrackerApp:
 
         # Basic URL validation
         if not re.match(r'^https?://(www\.)?amazon\..+', url):
-            messagebox.showerror("Error", "Please enter a valid Amazon  Amazon URL.")
+            messagebox.showerror("Error", "Please enter a valid Amazon URL.")
             return
 
         try:
@@ -321,7 +334,7 @@ class PriceTrackerApp:
         for row in c.fetchall():
             name = row[1][:30] + "..." if len(row[1]) > 30 else row[1]
             url = row[2][:40] + "..." if len(row[2]) > 40 else row[2]
-            self.tree.insert("", "end", values=(name, url, f"{row[3]:.2f}", f"{row[4]:.2f}" if row[4] else "N/A"))
+            self.tree.insert("", "end", values=(row[0], name, url, f"{row[3]:.2f}", f"{row[4]:.2f}" if row[4] else "N/A"))
             # Add tooltip for full text
             item_id = self.tree.get_children()[-1]
             ToolTip(self.tree, f"Name: {row[1]}\nURL: {row[2]}")
@@ -333,19 +346,15 @@ class PriceTrackerApp:
             messagebox.showwarning("No Selection", "Please select a product to remove.")
             return
         item = self.tree.item(selected[0])
-        url = item['values'][1]
-        if len(url) > 40:
-            url = url[:40] + "..."
-            c = sqlite3.connect('price_tracker.db').cursor()
-            c.execute("SELECT url FROM products WHERE url LIKE ?", (url[:40] + '%',))
-            url = c.fetchone()[0]
-            c.close()
-        confirm = messagebox.askyesno("Confirm Remove", f"Remove {item['values'][0]}?")
+        product_id = item['values'][0]  # Use hidden ID
+        name = item['values'][1]
+        confirm = messagebox.askyesno("Confirm Remove", f"Remove {name}?")
         if not confirm:
             return
         conn = sqlite3.connect('price_tracker.db')
         c = conn.cursor()
-        c.execute("DELETE FROM products WHERE url = ?", (url,))
+        c.execute("DELETE FROM products WHERE id = ?", (product_id,))
+        c.execute("DELETE FROM price_history WHERE product_id = ?", (product_id,))
         conn.commit()
         conn.close()
         self.load_products()
@@ -373,18 +382,12 @@ class PriceTrackerApp:
             messagebox.showwarning("No Selection", "Please select a product to view history.")
             return
         item = self.tree.item(selected[0])
-        url = item['values'][1]
-        if len(url) > 40:
-            url = url[:40] + "..."
-            c = sqlite3.connect('price_tracker.db').cursor()
-            c.execute("SELECT url FROM products WHERE url LIKE ?", (url[:40] + '%',))
-            url = c.fetchone()[0]
-            c.close()
+        product_id = item['values'][0]  # Use hidden ID
 
         conn = sqlite3.connect('price_tracker.db')
         c = conn.cursor()
-        c.execute("SELECT p.name, ph.price, ph.timestamp FROM products p JOIN price_history ph ON p.id = ph.product_id WHERE p.url = ?",
-                  (url,))
+        c.execute("SELECT p.name, ph.price, ph.timestamp FROM products p JOIN price_history ph ON p.id = ph.product_id WHERE p.id = ?",
+                  (product_id,))
         history = c.fetchall()
         conn.close()
 
@@ -414,7 +417,12 @@ class PriceTrackerApp:
 
     def sort_column(self, col, reverse):
         items = [(self.tree.set(item, col), item) for item in self.tree.get_children()]
-        items.sort(reverse=reverse, key=lambda x: float(x[0]) if col in ["Target Price", "Latest Price"] and x[0] != "N/A" else x[0])
+        # Handle numeric columns with "N/A"
+        def key_func(x):
+            if col in ["ID", "Target Price", "Latest Price"] and x[0] != "N/A":
+                return float(x[0]) if x[0] else float('inf')
+            return x[0].lower() if x[0] else ""
+        items.sort(reverse=reverse, key=key_func)
         for index, (_, item) in enumerate(items):
             self.tree.move(item, "", index)
         self.tree.heading(col, command=lambda: self.sort_column(col, not reverse))
